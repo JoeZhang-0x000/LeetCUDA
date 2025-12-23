@@ -1,139 +1,67 @@
-import time
-from functools import partial
-from typing import Optional
-
 import torch
-from torch.utils.cpp_extension import load
-
-torch.set_grad_enabled(False)
-
-# # Load the CUDA kernel as a python module
-# lib = load(
-#     name="sgemv_lib",
-#     sources=["sgemv.cu"],
-#     extra_cuda_cflags=[
-#         "-O3",
-#         "-U__CUDA_NO_HALF_OPERATORS__",
-#         "-U__CUDA_NO_HALF_CONVERSIONS__",
-#         "-U__CUDA_NO_HALF2_OPERATORS__",
-#         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-#         "--expt-relaxed-constexpr",
-#         "--expt-extended-lambda",
-#         "--use_fast_math",
-#     ],
-#     extra_cflags=["-std=c++17"],
-# )
+import triton
+import triton.testing
 
 import lib.sgemv as lib
 
-def run_benchmark(
-    perf_func: callable,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    tag: str,
-    out: Optional[torch.Tensor] = None,
-    warmup: int = 10,
-    iters: int = 200,
-    show_all: bool = False,
-):
-    if out is not None:
-        out.fill_(0)
-    if out is not None:
-        for i in range(warmup):
-            perf_func(a, b, out)
-    else:
-        for i in range(warmup):
-            _ = perf_func(a, b)
+torch.set_grad_enabled(False)
+dtype = torch.float32
+device = 'cuda'
 
-    torch.cuda.synchronize()
-    start = time.time()
- 
-    # iters
-    if out is not None:
-        for i in range(iters):
-            perf_func(a, b, out)
-    else:
-        for i in range(iters):
-            out = perf_func(a, b)
-    torch.cuda.synchronize()
-    end = time.time()
-    total_time = (end - start) * 1000  # ms
-    mean_time = total_time / iters
-    out_info = f"out_{tag}"
-    out_val = out.flatten().detach().cpu().numpy().tolist()[:3]
-    out_val = [round(v, 8) for v in out_val]
-    print(f"{out_info:>13}: {out_val}, time:{mean_time:.8f}ms")
-    if show_all:
-        print(out)
-    return out.clone(), mean_time
+SHAPES = [
+    (128, 128),
+    (1024, 128),
+    (1024, 256),
+    (4096, 128),
+    (2048, 256),
+    (128, 1024),
+    (256, 1024),
+    (1024, 1024),
+]
+SHAPE_LABELS = [f"{M}_{K}" for M, K in SHAPES]
 
-# ==============================================================
-# 128, 1, 1024
-# ==============================================================
+@triton.testing.perf_report([
+    triton.testing.Benchmark(
+        x_names=['M_K'],
+        x_vals=SHAPE_LABELS,
+        x_log=False,
+        line_arg='provider',
+        line_vals=['pytorch', 'custom_k32', 'custom_k128x4', 'custom_dispatch', ],
+        line_names=['PyTorch_Matmul', 'Custom_k32_f32', 'Custom_k128_f32x4', 'Custom_Dispatch', ],
+        styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('black', '--')],
+        ylabel='ms (Median)',
+        plot_name='SGEMV Performance (ms)',
+        args={"N": 1},
+    )
+])
+def benchmark(M_K, N, provider):
+    M, K = map(int, M_K.split("_"))
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((K, N), dtype=dtype, device=device)
+    
+    c_ref = torch.empty((M, N), dtype=dtype, device=device)
+    torch.matmul(a, b, out=c_ref)
 
-print("-" * 80)
-M, N, K = 128, 1, 1024
-a = torch.randn((M, K)).cuda().float().contiguous()
-b = torch.randn((K, N)).cuda().float().contiguous()
-c = torch.randn((M, N)).cuda().float().contiguous()
-run_benchmark(lib.sgemv_k32_f32, a, b, "k32f32", c)
-run_benchmark(lib.sgemv_k128_f32x4, a, b, "k128f32x4", c)
-run_benchmark(lib.sgemv, a, b, "my", c)
-run_benchmark(partial(torch.matmul, out=c), a, b, "f32_th")
-print("-" * 80)
+    if provider == 'custom_k32':
+        c_out = torch.empty_like(c_ref)
+        ms = triton.testing.do_bench(lambda: lib.sgemv_k32_f32(a, b, c_out))
+        assert torch.allclose(c_out, c_ref, atol=1e-4, rtol=1e-4)
 
-# ==============================================================
-# 1024, 1, 128 
-# ==============================================================
+    elif provider == 'custom_k128x4':
+        c_out = torch.empty_like(c_ref)
+        ms = triton.testing.do_bench(lambda: lib.sgemv_k128_f32x4(a, b, c_out))
+        assert torch.allclose(c_out, c_ref, atol=1e-4, rtol=1e-4)
 
-print("-" * 80)
-M, N, K = 1024, 1, 128
-a = torch.randn((M, K)).cuda().float().contiguous()
-b = torch.randn((K, N)).cuda().float().contiguous()
-c = torch.randn((M, N)).cuda().float().contiguous()
-run_benchmark(lib.sgemv_k32_f32, a, b, "k32f32", c)
-run_benchmark(lib.sgemv_k128_f32x4, a, b, "k128f32x4", c)
-run_benchmark(lib.sgemv, a, b, "my", c)
-run_benchmark(partial(torch.matmul, out=c), a, b, "f32_th")
-print("-" * 80)
+    elif provider == 'custom_dispatch':
+        c_out = torch.empty_like(c_ref)
+        ms = triton.testing.do_bench(lambda: lib.sgemv(a, b, c_out))
+        assert torch.allclose(c_out, c_ref, atol=1e-4, rtol=1e-4)
 
-# ==============================================================
-# 1024, 1, 1024
-# ==============================================================
+    elif provider == 'pytorch':
+        c_out = torch.empty_like(c_ref)
+        ms = triton.testing.do_bench(lambda: torch.matmul(a, b, out=c_out))
+    
+    return ms
 
-print("-" * 80)
-M, N, K = 1024, 1, 1024
-a = torch.randn((M, K)).cuda().float().contiguous()
-b = torch.randn((K, N)).cuda().float().contiguous()
-c = torch.randn((M, N)).cuda().float().contiguous()
-run_benchmark(lib.sgemv_k32_f32, a, b, "k32f32", c)
-run_benchmark(lib.sgemv_k128_f32x4, a, b, "k128f32x4", c)
-run_benchmark(lib.sgemv, a, b, "my", c)
-run_benchmark(partial(torch.matmul, out=c), a, b, "f32_th")
-
-# ==============================================================
-# 4096, 1, 128
-# ==============================================================
-
-print("-" * 80)
-M, N, K = 4096, 1, 128
-a = torch.randn((M, K)).cuda().float().contiguous()
-b = torch.randn((K, N)).cuda().float().contiguous()
-c = torch.randn((M, N)).cuda().float().contiguous()
-run_benchmark(lib.sgemv_k32_f32, a, b, "k32f32", c)
-run_benchmark(lib.sgemv_k128_f32x4, a, b, "k128f32x4", c)
-run_benchmark(lib.sgemv, a, b, "my", c)
-run_benchmark(partial(torch.matmul, out=c), a, b, "f32_th")
-
-# ==============================================================
-#  1024, 1, 16
-# ==============================================================
-
-# # M, N, K = 1024, 1, 16
-# a = torch.randn((M, K)).cuda().float().contiguous()
-# b = torch.randn((K, N)).cuda().float().contiguous()
-# c = torch.randn((M, N)).cuda().float().contiguous()
-# run_benchmark(lib.sgemv_k16_f32, a, b, "k16f32", c)
-# run_benchmark(lib.sgemv, a, b, "my", c)
-# run_benchmark(partial(torch.matmul, out=c), a, b, "f32_th")
-# print("-" * 80)
+if __name__ == "__main__":
+    benchmark.run(show_plots=False, print_data=True, save_path=None)

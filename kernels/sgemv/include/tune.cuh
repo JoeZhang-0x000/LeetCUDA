@@ -108,7 +108,7 @@ bool dispatch_kernel(const std::tuple<int, int, int> &config, float *a,
 
 void dispatch(float *a, float *x, float *y, int M, int K) {
   if (best_config_map.find({M, K}) == best_config_map.end()) {
-    std::cout << "first run, tuning...\n";
+    // std::cout << "first run, tuning...\n";
     Tunner::tune(a, x, y, M, K);
   }
   auto best_config = best_config_map.at({M, K});

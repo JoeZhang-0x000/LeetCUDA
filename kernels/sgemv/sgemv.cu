@@ -8,7 +8,12 @@
 #include <stdlib.h>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <torch/torch.h>
 #include <vector>
+#include <cub/cub.cuh>
+#include <pybind11/pybind11.h>
+#include "include/lib.cuh"
+#include "include/tune.cuh"
 
 #define WARP_SIZE 32
 #define INT4(value) (reinterpret_cast<int4 *>(&(value))[0])
@@ -23,6 +28,21 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
     val += __shfl_xor_sync(0xffffffff, val, mask);
   }
   return val;
+}
+
+template<typename T, const int vecsize>
+struct __align__(sizeof(T) * vecsize) vec_n{
+  T val[vecsize];
+};
+
+
+template<typename T, int N>
+__device__ __forceinline__ vec_n<T, N> load_vector(const T * addr){
+  return *reinterpret_cast<const vec_n<T, N>*>(addr);
+}
+
+__inline__ __device__ float float4_mul(float4 a, float4 b){
+  return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
 }
 
 // SGEMV: Warp SGEMV K32
@@ -76,7 +96,10 @@ __global__ void sgemv_k128_f32x4_kernel(float *a, float *x, float *y, int M,
       sum += (reg_a.x * reg_x.x + reg_a.y * reg_x.y + reg_a.z * reg_x.z +
               reg_a.w * reg_x.w);
     }
-    sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
+    // sum = warp_reduce_sum_f32<WARP_SIZE>(sum);
+    using WarpReduce = cub::WarpReduce<float>;
+    __shared__ typename WarpReduce::TempStorage temp_storage[4];
+    sum = WarpReduce(temp_storage[ty]).Sum(sum);
     if (lane == 0)
       y[m] = sum;
   }
@@ -131,6 +154,27 @@ __global__ void sgemv_k16_f32_kernel(float *A, float *x, float *y, int M,
   if (K != (V)) {                                                              \
     throw std::runtime_error("K must be " #V);                                 \
   }
+
+// ==============================================================
+//  my sgemv
+// ==============================================================
+
+void sgemv(torch::Tensor a, torch::Tensor x, torch::Tensor y) {
+  CHECK_TORCH_TENSOR_DTYPE(a, torch::kFloat32)
+  CHECK_TORCH_TENSOR_DTYPE(x, torch::kFloat32)
+  CHECK_TORCH_TENSOR_DTYPE(y, torch::kFloat32)
+  const int M = a.size(0);
+  const int K = a.size(1);
+  CHECK_TORCH_TENSOR_SHAPE(a, M, K)
+  CHECK_TORCH_TENSOR_SHAPE(x, K, 1)
+  CHECK_TORCH_TENSOR_SHAPE(y, M, 1)
+  ASSERT_K_IS_MULTIBLE_OF(32)
+
+  // using policy = Policy<128, 1, 1>;
+  dispatch(reinterpret_cast<float *>(a.data_ptr()),
+                         reinterpret_cast<float *>(x.data_ptr()),
+                         reinterpret_cast<float *>(y.data_ptr()), M, K);
+}
 
 void sgemv_k32_f32(torch::Tensor a, torch::Tensor x, torch::Tensor y) {
   CHECK_TORCH_TENSOR_DTYPE(a, torch::kFloat32)
@@ -197,8 +241,16 @@ void sgemv_k16_f32(torch::Tensor a, torch::Tensor x, torch::Tensor y) {
                         reinterpret_cast<float *>(y.data_ptr()), M, K);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  TORCH_BINDING_COMMON_EXTENSION(sgemv_k32_f32)
-  TORCH_BINDING_COMMON_EXTENSION(sgemv_k128_f32x4)
-  TORCH_BINDING_COMMON_EXTENSION(sgemv_k16_f32)
+// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//   TORCH_BINDING_COMMON_EXTENSION(sgemv_k32_f32)
+//   TORCH_BINDING_COMMON_EXTENSION(sgemv_k128_f32x4)
+//   TORCH_BINDING_COMMON_EXTENSION(sgemv_k16_f32)
+//   TORCH_BINDING_COMMON_EXTENSION(sgemv)
+// }
+
+PYBIND11_MODULE(sgemv, m){
+  m.def("sgemv_k32_f32", sgemv_k32_f32);
+  m.def("sgemv_k128_f32x4", sgemv_k128_f32x4);
+  m.def("sgemv_k16_f32", sgemv_k16_f32);
+  m.def("sgemv", sgemv);
 }
